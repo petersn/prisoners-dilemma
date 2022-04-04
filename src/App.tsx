@@ -25,13 +25,16 @@ function mean(l: number[]): number {
   return sum / l.length;
 }
 
-function colorAmount(x: number): string {
-  const scale = (x + 20) / 60.0;
-  const r = 255 - 255 * scale;
-  const g = 255 * scale;
+function colorAmount(x: number, iters: number): string {
+  const val = x / (3 * iters) + 1 / 3;
+  const r = 255 - 255 * val;
+  const g = 255 * val;
   const b = 64;
   return `rgba(${r}, ${g}, ${b}, 1)`;
 }
+
+// XXX: FIXME: Change this!
+const WS_HOST = '10.42.0.1';
 
 const DEFAULT_STARTING_CODE = `import random
 import itertools
@@ -47,7 +50,7 @@ class RandomBot:
 
 class RetaliateBot:
     def play(self, our_moves, their_moves):
-        # If they have defected in the last five moves, then defect.
+        # If they have defected in the last three moves, then defect.
         if Defect in their_moves[-3:]:
             return Defect
         # Otherwise, we cooperate.
@@ -70,7 +73,7 @@ class YourFirstBot:
         ...
         return Cooperate
 
-    
+
 # ===== Run a tournament between these bots =====    
 
 ITERATIONS = 20
@@ -104,7 +107,66 @@ run_tournament([
 ])
 `;
 
+function makeCode(base: string, botNames: string) {
+  return `import random
+import itertools
+
+${base.replaceAll('\t', '    ')}
+
+# ===== Run a tournament between these bots =====
+
+ITERATIONS = 30
+
+def play_game(a_class, b_class):
+    a_bot, b_bot = a_class(), b_class()
+    a_moves, b_moves = [], []
+    builtin_start_game(a_class.__name__, b_class.__name__)
+    for _ in range(ITERATIONS):
+        a_move = a_bot.play(a_moves, b_moves)
+        b_move = b_bot.play(b_moves, a_moves)
+        builtin_report_move(a_move, b_move)
+        a_moves.append(a_move)
+        b_moves.append(b_move)
+    builtin_end_game()
+
+def run_tournament(bots, rounds=5):
+    for a_class, b_class in itertools.product(bots, repeat=2):
+        for _ in range(rounds):
+            play_game(a_class, b_class)
+
+run_tournament([
+    ${botNames}
+])
+`;
+}
+
+const SLOT1_DEFAULT_CODE = `# Put your first bot here!
+
+class YourFirstBot:
+    def __init__(self):
+        # You can setup any state you want here.
+        pass
+
+    def play(self, our_moves, their_moves):
+        ...
+        return Cooperate
+`;
+
+const SLOT2_DEFAULT_CODE = `# Put your second bot here!
+
+class YourSecondBot:
+    def __init__(self):
+        # You can setup any state you want here.
+        pass
+
+    def play(self, our_moves, their_moves):
+        ...
+        return Cooperate
+`;
+
 interface ITextEditorProps {
+  lsKey: string;
+  startingCode: string;
   extraKeysMaker: (textEditorComponent: TextEditor) => any;
 }
 
@@ -116,14 +178,14 @@ class TextEditor extends React.PureComponent<ITextEditorProps, ITextEditorState>
   constructor(props: ITextEditorProps) {
     super(props);
     //this.state = { code:  };
-    if (localStorage.getItem('code') === null)
-      localStorage.setItem('code', DEFAULT_STARTING_CODE);
+    if (localStorage.getItem(this.props.lsKey) === null)
+      localStorage.setItem(this.props.lsKey, this.props.startingCode);
   }
 
   render() {
     return <div>
       <ControlledCodeMirror
-        value={localStorage.getItem('code')!}
+        value={localStorage.getItem(this.props.lsKey)!}
         options={{
           mode: 'python',
           theme: 'material',
@@ -133,7 +195,7 @@ class TextEditor extends React.PureComponent<ITextEditorProps, ITextEditorState>
           extraKeys: this.props.extraKeysMaker(this),
         }}
         onBeforeChange={(editor, data, code) => {
-          localStorage.setItem('code', code);
+          localStorage.setItem(this.props.lsKey, code);
           this.forceUpdate();
           //this.setState({ code });
         }}
@@ -158,10 +220,13 @@ class App extends React.PureComponent<{}, {
   paneColor: string;
   allGames: IGame[];
   competeOpen: boolean;
+  saved: [boolean, boolean];
+  streamUpdates: boolean;
 }> {
   textEditorRef = React.createRef<TextEditor>();
   socket: WebSocket | null;
   connectionAttempt = 0;
+  lastCompiled: any = null;
 
   constructor(props: {}) {
     super(props);
@@ -171,10 +236,16 @@ class App extends React.PureComponent<{}, {
       paneColor: '#222',
       allGames: [],
       competeOpen: false,
+      saved: [false, false],
+      streamUpdates: false,
     };
     this.socket = null;
 
+    if (localStorage.getItem('my-name') === null)
+      localStorage.setItem('my-name', '???');
+
     setTimeout(this.reconnect, 200);
+    setInterval(this.streamTick, 2000);
   }
 
   reconnect = () => {
@@ -182,7 +253,7 @@ class App extends React.PureComponent<{}, {
     this.setState({
       websocketState: `Connecting to server (try ${this.connectionAttempt})...`,
     });
-    this.socket = new WebSocket('ws://localhost:8765/');
+    this.socket = new WebSocket(`ws://${WS_HOST}:10100/`);
     this.socket.addEventListener('open', (event) => {
       this.setState({ websocketState: 'Connected' });
       this.connectionAttempt = 0;
@@ -196,7 +267,22 @@ class App extends React.PureComponent<{}, {
     // Listen for messages
     this.socket.addEventListener('message', (event) => {
       //this.setState({ message: event.data.toString() });
-      console.log('Message from server ', event.data);
+      const result = JSON.parse(event.data);
+      if (result.kind === 'submitted') {
+        const saved = [...this.state.saved] as [boolean, boolean];
+        saved[result.position - 1] = true;
+        this.setState({ saved });
+      }
+      if (result.kind === 'get') {
+        const compiled = makeCode(result.base, result.botNames);
+        localStorage.setItem('code', compiled);
+        console.log('Fetched code:', compiled);
+        this.forceUpdate();
+        if (this.state.streamUpdates && compiled !== this.lastCompiled) {
+          this.rerunCode();
+        }
+        this.lastCompiled = compiled;
+      }
     });
   }
 
@@ -204,7 +290,7 @@ class App extends React.PureComponent<{}, {
     const code = localStorage.getItem('code');
     if (code === null)
       return 'raise Exception("Internal bug: localStorage.code is null")';
-    return code.replace('\t', '    ');
+    return code.replaceAll('\t', '    ');
     //if (this.textEditorRef.current !== null)
     //  return this.textEditorRef.current.state.code.replace('\t', '    ');
     //return 'raise Exception("Internal bug: textEditorRef is null")';
@@ -215,7 +301,7 @@ class App extends React.PureComponent<{}, {
         terminalOutput: 'Running...',
         paneColor: '#334',
     });
-    setTimeout(() => {
+    //setTimeout(() => {
       const Sk = (window as any).Sk;
       Sk.pre = 'output';
       const code = 'print("Test skulpt message")\n';
@@ -286,7 +372,7 @@ class App extends React.PureComponent<{}, {
           results.push(obj.toString());
         },
         read: builtinRead,
-        execLimit: 3000,
+        execLimit: 5000,
       });
       var myPromise = Sk.misceval.asyncToPromise(() => {
         return Sk.importMainWithBody("<stdin>", false, this.getCode(), true);
@@ -306,11 +392,43 @@ class App extends React.PureComponent<{}, {
           });
         },
       );
-    }, 1);
+    //}, 1);
   }
 
-  onCompile(code: string) {
-    console.log(code);
+  streamTick = () => {
+    if (this.state.streamUpdates)
+      this.fetchCode();
+  }
+
+  fetchCode = () => {
+    if (this.socket === null) {
+      alert('Not connected! Try refreshing the page?');
+      return;
+    }
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      alert('Socket not connected! Try refreshing the page?');
+      return;
+    }
+    this.socket.send(JSON.stringify({
+      kind: 'get',
+    }));
+  }
+
+  submitBot(position: number, code: string) {
+    if (this.socket === null) {
+      alert('Not connected! Try refreshing the page?');
+      return;
+    }
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      alert('Socket not connected! Try refreshing the page?');
+      return;
+    }
+    this.socket.send(JSON.stringify({
+      kind: 'submit',
+      myName: localStorage.getItem('my-name')!,
+      position,
+      code,
+    }));
   }
 
   render() {
@@ -338,6 +456,7 @@ class App extends React.PureComponent<{}, {
     const gamesPlayed = new Map<string, number>();
     const crossTable = new Map<string, number[]>();
     const allPlayers: string[] = [];
+    let iters = 0;
 
     for (const game of this.state.allGames) {
       if (!scoreboard.has(game.nameA)) {
@@ -366,6 +485,8 @@ class App extends React.PureComponent<{}, {
           crossTable.set(namePair, []);
         crossTable.set(namePair, [...crossTable.get(namePair)!, score]);
       }
+
+      iters = game.movesA.length;
     }
 
     allPlayers.sort((a, b) => {
@@ -390,7 +511,7 @@ class App extends React.PureComponent<{}, {
           zIndex: 20,
         }}
       >
-        <div>
+        <div className='mainPane'>
 
           {/* Top left bar */}
           <div style={{
@@ -444,17 +565,26 @@ class App extends React.PureComponent<{}, {
             */}
 
             <div style={{ fontSize: '130%', marginLeft: 10 }}>
+              {this.state.streamUpdates && '* '}
               State: {this.state.websocketState}
             </div>
           </div>
 
           <TextEditor
+            lsKey='code'
+            startingCode={DEFAULT_STARTING_CODE}
             ref={this.textEditorRef}
             extraKeysMaker={(textEditorComponent) => ({
               'Ctrl-Enter': (cm: any) => {
                 this.rerunCode();
               },
               'Ctrl-S': (cm: any) => {},
+              'Ctrl-E': (cm: any) => {
+                if (localStorage.getItem('my-name') !== 'dev')
+                  return;
+                this.setState({ streamUpdates: !this.state.streamUpdates });
+                //this.fetchCode();
+              },
               //'Tab': (cm: any) => {
               //  cm.replaceSelection('    ', 'end');
               //},
@@ -536,7 +666,8 @@ class App extends React.PureComponent<{}, {
                     <td style={{
                       border: '1px solid black',
                       textAlign: 'center',
-                      backgroundColor: colorAmount(mean(crossTable.get(playerName + ' |vs| ' + otherPlayerName)!)),
+                      backgroundColor: colorAmount(
+                        mean(crossTable.get(playerName + ' |vs| ' + otherPlayerName)!), iters),
                     }}>{mean(crossTable.get(playerName + ' |vs| ' + otherPlayerName)!)}</td>
                   )}
                 </tr>
@@ -584,9 +715,83 @@ class App extends React.PureComponent<{}, {
         transform: 'translate(810px, 0px)',
         overflowY: 'scroll',
       }}>
+        <div style={{ position: 'sticky', top: 0 }}>
+          <div
+            style={{ position: 'absolute', top: 5, right: 5, fontSize: '120%', padding: 4 }}
+            className='hoverButton'
+            onClick={() => this.setState({ competeOpen: false })}
+          >
+            ✕
+          </div>
+        </div>
+
         <b>Compete against your fellow students!</b><br/>
         <br/>
-        This is more.
+        <span style={{ fontSize: '150%' }}>
+          Put your name here: <input
+            value={localStorage.getItem('my-name')!}
+            onChange={(evt) => {
+              localStorage.setItem('my-name', evt.target.value );
+              this.forceUpdate();
+            }}
+          />
+        </span>
+        <br/>
+        <br/>
+        Each student gets two bot slots.
+        Your bots will be graded on how they do against <i>all</i> bots (including themself and your other bot).
+
+        <br/>
+        <br/>
+        <b>Bot slot #1:</b>
+        <TextEditor
+          lsKey='slot1-code'
+          startingCode={SLOT1_DEFAULT_CODE}
+          extraKeysMaker={(textEditorComponent) => ({
+            'Ctrl-S': (cm: any) => {},
+          })}
+        />
+        <div
+          style={{
+            bottom: 10,
+            right: 10,
+            display: 'inline-block',
+            opacity: localStorage.getItem('my-name') === '???' ? 0.5 : 1,
+          }}
+          className='mainButton'
+          onClick={() => {
+            this.submitBot(1, localStorage.getItem('slot1-code')!);
+          }}
+        >
+          Submit Bot #1
+        </div>
+        {this.state.saved[0] && 'Submitted successfully!'}
+        <br/>
+
+        <br/>
+        <b>Bot slot #2:</b>
+        <TextEditor
+          lsKey='slot2-code'
+          startingCode={SLOT2_DEFAULT_CODE}
+          extraKeysMaker={(textEditorComponent) => ({
+            'Ctrl-S': (cm: any) => {},
+          })}
+        />
+        <div
+          style={{
+            bottom: 10,
+            right: 10,
+            display: 'inline-block',
+            opacity: localStorage.getItem('my-name') === '???' ? 0.5 : 1,
+          }}
+          className='mainButton'
+          onClick={() => {
+            this.submitBot(2, localStorage.getItem('slot2-code')!);
+          }}
+        >
+          Submit Bot #2
+        </div>
+        {this.state.saved[1] && 'Submitted successfully!'}
       </div>
     </div>;
   }

@@ -29,8 +29,16 @@
   background-color: #666;
 }
 
+html {
+  overflow: hidden;
+}
 
-.CodeMirror, .react-codemirror2 {
+.mainPane .CodeMirror {
+  /*height: 100vh !important;*/
+  height: calc(100vh - 60px) !important;
+}
+
+.mainPane .react-codemirror2 {
   /*height: 100vh !important;*/
   height: calc(100vh - 60px) !important;
 }
